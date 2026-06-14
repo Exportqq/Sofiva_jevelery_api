@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, Column, String, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -28,6 +29,14 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # =====================
@@ -205,7 +214,6 @@ def upload_to_yandex(file: UploadFile):
 
     filename = f"{uuid4()}_{file.filename}"
 
-    # 1. получаем ссылку для загрузки
     r = requests.get(
         "https://cloud-api.yandex.net/v1/disk/resources/upload",
         headers=headers,
@@ -214,17 +222,14 @@ def upload_to_yandex(file: UploadFile):
 
     upload_url = r.json()["href"]
 
-    # 2. загружаем файл
     requests.put(upload_url, files={"file": file.file})
 
-    # 3. делаем публичным
     requests.put(
         "https://cloud-api.yandex.net/v1/disk/resources/publish",
         headers=headers,
         params={"path": f"/jewelry/{filename}"}
     )
 
-    # 4. получаем публичную ссылку
     info = requests.get(
         "https://cloud-api.yandex.net/v1/disk/resources",
         headers=headers,
