@@ -11,10 +11,6 @@ import bcrypt
 import os
 import requests
 
-# =====================
-# CONFIG
-# =====================
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = os.getenv("SECRET_KEY", "secret")
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
@@ -44,7 +40,6 @@ app.add_middleware(
 
 class User(Base):
     __tablename__ = "users"
-
     id = Column(String, primary_key=True)
     username = Column(String, unique=True)
     password = Column(String)
@@ -52,7 +47,6 @@ class User(Base):
 
 class Request(Base):
     __tablename__ = "requests"
-
     id = Column(String, primary_key=True)
     name = Column(String)
     phone = Column(String)
@@ -61,7 +55,6 @@ class Request(Base):
 
 class Jewelry(Base):
     __tablename__ = "jewelry"
-
     id = Column(String, primary_key=True)
     image_url = Column(String)
 
@@ -79,9 +72,13 @@ def hash_password(p: str) -> str:
 def verify_password(p: str, h: str) -> bool:
     return bcrypt.checkpw(p.encode(), h.encode())
 
-def create_token(user_id: str):
+def create_token(user_id: str, username: str):
     return jwt.encode(
-        {"sub": user_id, "exp": datetime.utcnow() + timedelta(days=7)},
+        {
+            "sub": user_id,
+            "username": username,
+            "exp": datetime.utcnow() + timedelta(days=7)
+        },
         SECRET_KEY,
         algorithm=ALGORITHM
     )
@@ -96,7 +93,7 @@ def get_db():
 def get_user(token: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(token.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload["sub"]
+        return {"user_id": payload["sub"], "username": payload["username"]}
     except JWTError:
         raise HTTPException(401, "Invalid token")
 
@@ -133,7 +130,6 @@ def register(data: AuthDTO):
             username=data.username,
             password=hash_password(data.password)
         )
-
         db.add(user)
         db.commit()
 
@@ -151,14 +147,14 @@ def login(data: AuthDTO):
         if not user or not verify_password(data.password, user.password):
             raise HTTPException(400, "Invalid credentials")
 
-        return {"token": create_token(user.id)}
+        return {"token": create_token(user.id, user.username)}
     finally:
         db.close()
 
 
 @app.get("/auth/me")
-def me(user_id=Depends(get_user)):
-    return {"user_id": user_id}
+def me(user=Depends(get_user)):
+    return {"user_id": user["user_id"], "username": user["username"]}
 
 
 # =====================
@@ -175,7 +171,6 @@ def create_request(data: RequestDTO):
             phone=data.phone,
             comment=data.comment
         )
-
         db.add(req)
         db.commit()
 
@@ -239,7 +234,6 @@ def upload_card(file: UploadFile = File(...)):
             id=str(uuid4()),
             image_url=url
         )
-
         db.add(card)
         db.commit()
 
