@@ -1,27 +1,18 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, Column, String, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
-from jose import jwt, JWTError
 from uuid import uuid4
-from datetime import datetime, timedelta
-import bcrypt
 import os
 import requests
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-SECRET_KEY = os.getenv("SECRET_KEY", "secret")
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
-
-ALGORITHM = "HS256"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
-
-security = HTTPBearer()
 
 app = FastAPI()
 
@@ -37,13 +28,6 @@ app.add_middleware(
 # =====================
 # MODELS
 # =====================
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(String, primary_key=True)
-    username = Column(String, unique=True)
-    password = Column(String)
-
 
 class Request(Base):
     __tablename__ = "requests"
@@ -63,98 +47,13 @@ Base.metadata.create_all(bind=engine)
 
 
 # =====================
-# UTILS
-# =====================
-
-def hash_password(p: str) -> str:
-    return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
-
-def verify_password(p: str, h: str) -> bool:
-    return bcrypt.checkpw(p.encode(), h.encode())
-
-def create_token(user_id: str, username: str):
-    return jwt.encode(
-        {
-            "sub": user_id,
-            "username": username,
-            "exp": datetime.utcnow() + timedelta(days=7)
-        },
-        SECRET_KEY,
-        algorithm=ALGORITHM
-    )
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_user(token: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(token.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        return {"user_id": payload["sub"], "username": payload["username"]}
-    except JWTError:
-        raise HTTPException(401, "Invalid token")
-
-
-# =====================
 # DTO
 # =====================
-
-class AuthDTO(BaseModel):
-    username: str
-    password: str
-
 
 class RequestDTO(BaseModel):
     name: str
     phone: str
     comment: str | None = None
-
-
-# =====================
-# AUTH
-# =====================
-
-@app.post("/auth/register")
-def register(data: AuthDTO):
-    db = SessionLocal()
-    try:
-        exists = db.query(User).filter(User.username == data.username).first()
-        if exists:
-            raise HTTPException(400, "User exists")
-
-        user = User(
-            id=str(uuid4()),
-            username=data.username,
-            password=hash_password(data.password)
-        )
-        db.add(user)
-        db.commit()
-
-        return {"ok": True}
-    finally:
-        db.close()
-
-
-@app.post("/auth/login")
-def login(data: AuthDTO):
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.username == data.username).first()
-
-        if not user or not verify_password(data.password, user.password):
-            raise HTTPException(400, "Invalid credentials")
-
-        return {"token": create_token(user.id, user.username)}
-    finally:
-        db.close()
-
-
-@app.get("/auth/me")
-def me(user=Depends(get_user)):
-    return {"user_id": user["user_id"], "username": user["username"]}
 
 
 # =====================
