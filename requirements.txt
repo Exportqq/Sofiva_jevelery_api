@@ -7,3 +7,4 @@ bcrypt
 requests
 psycopg2-binary
 python-multipart
+httpx
