@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, JSON
+from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, JSON, ARRAY
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
 from uuid import uuid4
@@ -106,7 +106,7 @@ class Product(Base):
     category = Column(String, nullable=False)
     brand = Column(String, nullable=False)
     material = Column(String, nullable=False)
-    size = Column(JSON, nullable=False)
+    size = Column(ARRAY(Float), nullable=False)
     weight = Column(Float, nullable=False)
     price = Column(Numeric(12, 2), nullable=False)
 
