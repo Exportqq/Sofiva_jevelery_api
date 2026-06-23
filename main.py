@@ -1,17 +1,17 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, JSON
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
 from uuid import uuid4
 from typing import Optional, List
 import os
-import shutil
+import httpx
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-PHOTOS_DIR = "photos"
+YANDEX_TOKEN = os.getenv("YANDEX_DISK_TOKEN")
+YANDEX_FOLDER = os.getenv("YANDEX_DISK_FOLDER", "sofiva")  # папка на Яндекс.Диске
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -37,15 +37,12 @@ ACCESS = {
     "POST /products": False,
     "PATCH /products/{id}": False,
     "DELETE /products/{id}": False,
+
+    "GET /photos/{filename}": True,
+    "POST /upload": False,
 }
 
 app = FastAPI()
-
-# Создаём папку если нет
-os.makedirs(PHOTOS_DIR, exist_ok=True)
-
-# Раздаём фото напрямую: /photos/bulgari_1.png
-app.mount("/photos", StaticFiles(directory="photos"), name="photos")
 
 
 # =====================
@@ -127,6 +124,74 @@ class Product(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
+
+# =====================
+# YANDEX DISK HELPERS
+# =====================
+
+def yadisk_headers() -> dict:
+    return {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+
+
+async def yadisk_get_download_url(filename: str) -> str:
+    """Получить свежую временную ссылку на скачивание файла с Яндекс.Диска."""
+    path = f"disk:/{YANDEX_FOLDER}/{filename}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/download",
+            params={"path": path},
+            headers=yadisk_headers(),
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=404, detail=f"Photo not found on Yandex Disk: {filename}")
+    return resp.json()["href"]
+
+
+async def yadisk_upload(filename: str, data: bytes, mime_type: str) -> None:
+    """Загрузить файл на Яндекс.Диск."""
+    path = f"disk:/{YANDEX_FOLDER}/{filename}"
+
+    # Убедимся что папка существует
+    async with httpx.AsyncClient() as client:
+        await client.put(
+            "https://cloud-api.yandex.net/v1/disk/resources",
+            params={"path": f"disk:/{YANDEX_FOLDER}"},
+            headers=yadisk_headers(),
+        )
+
+    # Получаем URL для загрузки
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://cloud-api.yandex.net/v1/disk/resources/upload",
+            params={"path": path, "overwrite": "true"},
+            headers=yadisk_headers(),
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to get upload URL from Yandex Disk")
+
+    upload_url = resp.json()["href"]
+
+    # Загружаем файл
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        upload_resp = await client.put(
+            upload_url,
+            content=data,
+            headers={"Content-Type": mime_type},
+        )
+    if upload_resp.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail="Failed to upload file to Yandex Disk")
+
+
+async def yadisk_delete(filename: str) -> None:
+    """Удалить файл с Яндекс.Диска (в корзину)."""
+    path = f"disk:/{YANDEX_FOLDER}/{filename}"
+    async with httpx.AsyncClient() as client:
+        await client.delete(
+            "https://cloud-api.yandex.net/v1/disk/resources",
+            params={"path": path, "permanently": "false"},
+            headers=yadisk_headers(),
+        )
 
 
 # =====================
@@ -213,17 +278,27 @@ class ProductUpdateDTO(BaseModel):
 
 
 # =====================
+# PHOTOS ENDPOINT
+# =====================
+
+@app.get("/photos/{filename}")
+async def get_photo(filename: str):
+    """Проксирует запрос на Яндекс.Диск и делает redirect на свежую ссылку."""
+    href = await yadisk_get_download_url(filename)
+    return RedirectResponse(url=href)
+
+
+# =====================
 # UPLOAD
 # =====================
 
 @app.post("/upload")
 async def upload_photo(file: UploadFile = File(...)):
-    filename = f"{uuid4()}_{file.filename}"
-    filepath = os.path.join(PHOTOS_DIR, filename)
-
-    with open(filepath, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
+    """Загружает фото на Яндекс.Диск, возвращает имя файла."""
+    ext = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
+    filename = f"{uuid4()}{ext}"
+    data = await file.read()
+    await yadisk_upload(filename, data, file.content_type or "image/jpeg")
     return {"filename": filename, "url": f"/photos/{filename}"}
 
 
@@ -352,19 +427,17 @@ def update_product(product_id: str, data: ProductUpdateDTO):
 
 
 @app.delete("/products/{product_id}")
-def delete_product(product_id: str):
+async def delete_product(product_id: str):
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == product_id).first()
         if not product:
             raise HTTPException(404, "Product not found")
 
-        # Удаляем файлы
+        # Удаляем файлы с Яндекс.Диска
         for field in [product.photo_1, product.photo_2, product.photo_3, product.photo_4]:
             if field:
-                filepath = os.path.join(PHOTOS_DIR, field)
-                if os.path.exists(filepath):
-                    os.remove(filepath)
+                await yadisk_delete(field)
 
         db.delete(product)
         db.commit()
