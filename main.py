@@ -11,7 +11,7 @@ import httpx
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 YANDEX_TOKEN = os.getenv("YANDEX_DISK_TOKEN")
-YANDEX_FOLDER = os.getenv("YANDEX_DISK_FOLDER", "sofiva")  # папка на Яндекс.Диске
+YANDEX_FOLDER = os.getenv("YANDEX_DISK_FOLDER", "sofiva/products")  # папка на Яндекс.Диске
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
