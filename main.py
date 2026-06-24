@@ -1,23 +1,63 @@
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, JSON, ARRAY
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, ARRAY
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
 from uuid import uuid4
 from typing import Optional, List
 import os
-import httpx
+import boto3
+from botocore.client import Config
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-YANDEX_TOKEN = os.getenv("YANDEX_DISK_TOKEN")
-YANDEX_FOLDER = os.getenv("YANDEX_DISK_FOLDER", "sofiva/products")  # папка на Яндекс.Диске
 
-engine = create_engine(DATABASE_URL)
+VK_ACCESS_KEY_ID     = os.getenv("VK_ACCESS_KEY_ID")
+VK_SECRET_ACCESS_KEY = os.getenv("VK_SECRET_ACCESS_KEY")
+VK_BUCKET            = os.getenv("VK_BUCKET", "sofiva-products")
+VK_ENDPOINT          = os.getenv("VK_ENDPOINT", "https://hb.vkcs.cloud")
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    pool_size=5,
+    max_overflow=10,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 ALLOWED_IPS = {"95.27.149.212"}
+
+# =====================
+# S3 CLIENT
+# =====================
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=VK_ENDPOINT,
+    aws_access_key_id=VK_ACCESS_KEY_ID,
+    aws_secret_access_key=VK_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="ru-msk",
+)
+
+def s3_public_url(filename: str) -> str:
+    """Постоянная публичная ссылка на файл в VK Cloud S3."""
+    return f"{VK_ENDPOINT}/{VK_BUCKET}/{filename}"
+
+def s3_upload(filename: str, data: bytes, content_type: str) -> None:
+    s3.put_object(
+        Bucket=VK_BUCKET,
+        Key=filename,
+        Body=data,
+        ContentType=content_type,
+        ACL="public-read",
+    )
+
+def s3_delete(filename: str) -> None:
+    s3.delete_object(Bucket=VK_BUCKET, Key=filename)
+
 
 # =====================
 # НАСТРОЙКА ДОСТУПА
@@ -38,7 +78,6 @@ ACCESS = {
     "PATCH /products/{id}": False,
     "DELETE /products/{id}": False,
 
-    "GET /photos/{filename}": True,
     "POST /upload": False,
 }
 
@@ -91,33 +130,33 @@ app.add_middleware(
 class RequestModel(Base):
     __tablename__ = "requests"
 
-    id = Column(String, primary_key=True)
-    name = Column(String)
-    phone = Column(String)
+    id      = Column(String, primary_key=True)
+    name    = Column(String)
+    phone   = Column(String)
     comment = Column(Text)
-    status = Column(String, default="new")
+    status  = Column(String, default="new")
 
 
 class Product(Base):
     __tablename__ = "products"
 
-    id = Column(String, primary_key=True)
-    name = Column(String, nullable=False)
+    id       = Column(String, primary_key=True)
+    name     = Column(String, nullable=False)
     category = Column(String, nullable=False)
-    brand = Column(String, nullable=False)
+    brand    = Column(String, nullable=False)
     material = Column(String, nullable=False)
-    size = Column(ARRAY(Float), nullable=False)
-    weight = Column(Float, nullable=False)
-    price = Column(Numeric(12, 2), nullable=False)
+    size     = Column(ARRAY(Float), nullable=False)
+    weight   = Column(Float, nullable=False)
+    price    = Column(Numeric(12, 2), nullable=False)
 
-    # Только имена файлов: bulgari_1.png
+    # Полные публичные URL из S3
     photo_1 = Column(String, nullable=False)
     photo_2 = Column(String, nullable=True)
     photo_3 = Column(String, nullable=True)
     photo_4 = Column(String, nullable=True)
 
     # Камень
-    stone_type = Column(String, nullable=True)
+    stone_type  = Column(String, nullable=True)
     stone_carat = Column(Float, nullable=True)
     stone_shape = Column(String, nullable=True)
     stone_color = Column(String, nullable=True)
@@ -127,95 +166,23 @@ Base.metadata.create_all(bind=engine)
 
 
 # =====================
-# YANDEX DISK HELPERS
-# =====================
-
-def yadisk_headers() -> dict:
-    return {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-
-
-async def yadisk_get_download_url(filename: str) -> str:
-    """Получить свежую временную ссылку на скачивание файла с Яндекс.Диска."""
-    path = f"disk:/{YANDEX_FOLDER}/{filename}"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/download",
-            params={"path": path},
-            headers=yadisk_headers(),
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=404, detail=f"Photo not found on Yandex Disk: {filename}")
-    return resp.json()["href"]
-
-
-async def yadisk_upload(filename: str, data: bytes, mime_type: str) -> None:
-    """Загрузить файл на Яндекс.Диск."""
-    path = f"disk:/{YANDEX_FOLDER}/{filename}"
-
-    # Убедимся что папка существует
-    async with httpx.AsyncClient() as client:
-        await client.put(
-            "https://cloud-api.yandex.net/v1/disk/resources",
-            params={"path": f"disk:/{YANDEX_FOLDER}"},
-            headers=yadisk_headers(),
-        )
-
-    # Получаем URL для загрузки
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://cloud-api.yandex.net/v1/disk/resources/upload",
-            params={"path": path, "overwrite": "true"},
-            headers=yadisk_headers(),
-        )
-    if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to get upload URL from Yandex Disk")
-
-    upload_url = resp.json()["href"]
-
-    # Загружаем файл
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        upload_resp = await client.put(
-            upload_url,
-            content=data,
-            headers={"Content-Type": mime_type},
-        )
-    if upload_resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail="Failed to upload file to Yandex Disk")
-
-
-async def yadisk_delete(filename: str) -> None:
-    """Удалить файл с Яндекс.Диска (в корзину)."""
-    path = f"disk:/{YANDEX_FOLDER}/{filename}"
-    async with httpx.AsyncClient() as client:
-        await client.delete(
-            "https://cloud-api.yandex.net/v1/disk/resources",
-            params={"path": path, "permanently": "false"},
-            headers=yadisk_headers(),
-        )
-
-
-# =====================
 # HELPERS
 # =====================
 
 def product_to_dict(p: Product) -> dict:
-    photos = []
-    for field in [p.photo_1, p.photo_2, p.photo_3, p.photo_4]:
-        if field:
-            photos.append(f"/photos/{field}")
-
+    photos = [f for f in [p.photo_1, p.photo_2, p.photo_3, p.photo_4] if f]
     return {
-        "id": p.id,
-        "name": p.name,
+        "id":       p.id,
+        "name":     p.name,
         "category": p.category,
-        "brand": p.brand,
+        "brand":    p.brand,
         "material": p.material,
-        "size": p.size if isinstance(p.size, list) else p.size,
-        "weight": p.weight,
-        "price": float(p.price),
-        "photos": photos,
+        "size":     p.size if isinstance(p.size, list) else p.size,
+        "weight":   p.weight,
+        "price":    float(p.price),
+        "photos":   photos,
         "stone": {
-            "type": p.stone_type,
+            "type":  p.stone_type,
             "carat": p.stone_carat,
             "shape": p.stone_shape,
             "color": p.stone_color,
@@ -251,41 +218,30 @@ class ProductCreateDTO(BaseModel):
     photo_3: Optional[str] = None
     photo_4: Optional[str] = None
 
-    stone_type: Optional[str] = None
+    stone_type:  Optional[str]   = None
     stone_carat: Optional[float] = None
-    stone_shape: Optional[str] = None
-    stone_color: Optional[str] = None
+    stone_shape: Optional[str]   = None
+    stone_color: Optional[str]   = None
 
 
 class ProductUpdateDTO(BaseModel):
-    name: Optional[str] = None
-    category: Optional[str] = None
-    brand: Optional[str] = None
-    material: Optional[str] = None
-    size: Optional[List[float]] = None
-    weight: Optional[float] = None
-    price: Optional[float] = None
+    name:     Optional[str]        = None
+    category: Optional[str]        = None
+    brand:    Optional[str]        = None
+    material: Optional[str]        = None
+    size:     Optional[List[float]] = None
+    weight:   Optional[float]      = None
+    price:    Optional[float]      = None
 
     photo_1: Optional[str] = None
     photo_2: Optional[str] = None
     photo_3: Optional[str] = None
     photo_4: Optional[str] = None
 
-    stone_type: Optional[str] = None
+    stone_type:  Optional[str]   = None
     stone_carat: Optional[float] = None
-    stone_shape: Optional[str] = None
-    stone_color: Optional[str] = None
-
-
-# =====================
-# PHOTOS ENDPOINT
-# =====================
-
-@app.get("/photos/{filename}")
-async def get_photo(filename: str):
-    """Проксирует запрос на Яндекс.Диск и делает redirect на свежую ссылку."""
-    href = await yadisk_get_download_url(filename)
-    return RedirectResponse(url=href)
+    stone_shape: Optional[str]   = None
+    stone_color: Optional[str]   = None
 
 
 # =====================
@@ -294,12 +250,18 @@ async def get_photo(filename: str):
 
 @app.post("/upload")
 async def upload_photo(file: UploadFile = File(...)):
-    """Загружает фото на Яндекс.Диск, возвращает имя файла."""
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
+    """Загружает фото в VK Cloud S3, возвращает публичный URL."""
+    ext      = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
     filename = f"{uuid4()}{ext}"
-    data = await file.read()
-    await yadisk_upload(filename, data, file.content_type or "image/jpeg")
-    return {"filename": filename, "url": f"/photos/{filename}"}
+    data     = await file.read()
+
+    try:
+        s3_upload(filename, data, file.content_type or "image/jpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+
+    url = s3_public_url(filename)
+    return {"filename": filename, "url": url}
 
 
 # =====================
@@ -315,7 +277,7 @@ def create_request(data: RequestDTO):
             name=data.name,
             phone=data.phone,
             comment=data.comment,
-            status="new"
+            status="new",
         )
         db.add(req)
         db.commit()
@@ -329,11 +291,11 @@ def get_requests():
     db = SessionLocal()
     try:
         return [{
-            "id": r.id,
-            "name": r.name,
-            "phone": r.phone,
+            "id":      r.id,
+            "name":    r.name,
+            "phone":   r.phone,
             "comment": r.comment,
-            "status": r.status,
+            "status":  r.status,
         } for r in db.query(RequestModel).all()]
     finally:
         db.close()
@@ -378,8 +340,7 @@ def delete_request(request_id: str):
 def get_products():
     db = SessionLocal()
     try:
-        products = db.query(Product).all()
-        return [product_to_dict(p) for p in products]
+        return [product_to_dict(p) for p in db.query(Product).all()]
     finally:
         db.close()
 
@@ -400,10 +361,7 @@ def get_product(product_id: str):
 def create_product(data: ProductCreateDTO):
     db = SessionLocal()
     try:
-        product = Product(
-            id=str(uuid4()),
-            **data.model_dump()
-        )
+        product = Product(id=str(uuid4()), **data.model_dump())
         db.add(product)
         db.commit()
         return {"ok": True, "id": product.id}
@@ -427,17 +385,22 @@ def update_product(product_id: str, data: ProductUpdateDTO):
 
 
 @app.delete("/products/{product_id}")
-async def delete_product(product_id: str):
+def delete_product(product_id: str):
     db = SessionLocal()
     try:
         product = db.query(Product).filter(Product.id == product_id).first()
         if not product:
             raise HTTPException(404, "Product not found")
 
-        # Удаляем файлы с Яндекс.Диска
-        for field in [product.photo_1, product.photo_2, product.photo_3, product.photo_4]:
-            if field:
-                await yadisk_delete(field)
+        # Удаляем файлы из S3
+        for url in [product.photo_1, product.photo_2, product.photo_3, product.photo_4]:
+            if url:
+                # Извлекаем filename из полного URL
+                filename = url.split(f"/{VK_BUCKET}/")[-1]
+                try:
+                    s3_delete(filename)
+                except Exception:
+                    pass
 
         db.delete(product)
         db.commit()
