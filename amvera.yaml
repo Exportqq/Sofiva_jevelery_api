@@ -8,5 +8,7 @@ build:
   requirementsPath: requirements.txt
 
 run:
+  scriptName: main.py
   persistenceMount: /data
   command: uvicorn main:app --host 0.0.0.0 --port 8080
+  containerPort: 8080
