@@ -126,6 +126,9 @@ async def ip_whitelist(request: Request, call_next):
             )
     return await call_next(request)
 
+@app.get("/debug-ip")
+async def debug_ip(request: Request):
+    return dict(request.headers)
 
 app.add_middleware(
     CORSMiddleware,
