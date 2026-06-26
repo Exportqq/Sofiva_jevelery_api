@@ -1,6 +1,9 @@
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
 from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, ARRAY
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel
@@ -8,14 +11,16 @@ from uuid import uuid4
 from typing import Optional, List
 import os
 import boto3
+import secrets
 from botocore.client import Config
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
+DATABASE_URL         = os.getenv("DATABASE_URL")
 VK_ACCESS_KEY_ID     = os.getenv("VK_ACCESS_KEY_ID")
 VK_SECRET_ACCESS_KEY = os.getenv("VK_SECRET_ACCESS_KEY")
 VK_BUCKET            = os.getenv("VK_BUCKET", "sofiva-products")
 VK_ENDPOINT          = os.getenv("VK_ENDPOINT", "https://hb.vkcs.cloud")
+ADMIN_LOGIN          = os.getenv("ADMIN_LOGIN", "admin")
+ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "changeme")
 
 engine = create_engine(
     DATABASE_URL,
@@ -27,7 +32,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-ALLOWED_IPS = {"95.27.149.212"}
 
 # =====================
 # S3 CLIENT
@@ -43,7 +47,6 @@ s3 = boto3.client(
 )
 
 def s3_public_url(filename: str) -> str:
-    """Постоянная публичная ссылка на файл в VK Cloud S3."""
     return f"{VK_ENDPOINT}/{VK_BUCKET}/{filename}"
 
 def s3_upload(filename: str, data: bytes, content_type: str) -> None:
@@ -60,75 +63,28 @@ def s3_delete(filename: str) -> None:
 
 
 # =====================
-# НАСТРОЙКА ДОСТУПА
+# BASIC AUTH
 # =====================
 
-ACCESS = {
-    "POST /requests": True,
-    "GET /requests": False,
-    "PATCH /requests/{id}/status": False,
-    "DELETE /requests/{id}": False,
-    "GET /docs": False,
-    "GET /redoc": False,
-    "GET /openapi.json": False,
+security = HTTPBasic()
 
-    "GET /products": True,
-    "GET /products/{id}": True,
-    "POST /products": False,
-    "PATCH /products/{id}": False,
-    "DELETE /products/{id}": False,
-
-    "POST /upload": False,
-}
-
-app = FastAPI()
+def basic_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_login    = secrets.compare_digest(credentials.username, ADMIN_LOGIN)
+    ok_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (ok_login and ok_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials
 
 
 # =====================
-# IP WHITELIST
+# APP
 # =====================
 
-def match_route(method: str, path: str) -> bool:
-    for route, is_public in ACCESS.items():
-        r_method, r_path = route.split(" ", 1)
-        if method != r_method:
-            continue
-        if path == r_path:
-            return is_public
-        r_parts = r_path.split("/")
-        p_parts = path.split("/")
-        if len(r_parts) != len(p_parts):
-            continue
-        if all(r == p or r.startswith("{") for r, p in zip(r_parts, p_parts)):
-            return is_public
-    return True
-
-
-@app.middleware("http")
-async def ip_whitelist(request: Request, call_next):
-    is_public = match_route(request.method, request.url.path)
-    if not is_public:
-        forwarded_for = request.headers.get("X-Forwarded-For")
-        x_real_ip = request.headers.get("X-Real-IP")
-
-        if x_real_ip:
-            client_ip = x_real_ip.strip()
-        elif forwarded_for:
-            # Берём первый IP в цепочке — это оригинальный клиент
-            client_ip = forwarded_for.split(",")[0].strip()
-        else:
-            client_ip = request.client.host
-
-        if client_ip not in ALLOWED_IPS:
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Forbidden", "your_ip": client_ip}  # временно для дебага
-            )
-    return await call_next(request)
-
-@app.get("/debug-ip")
-async def debug_ip(request: Request):
-    return dict(request.headers)
+app = FastAPI(docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,6 +93,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =====================
+# SWAGGER (защищённый)
+# =====================
+
+@app.get("/docs", include_in_schema=False)
+def custom_swagger(credentials=Depends(basic_auth)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="SofiVa API")
+
+@app.get("/openapi.json", include_in_schema=False)
+def custom_openapi_json(credentials=Depends(basic_auth)):
+    return get_openapi(title="SofiVa API", version="1.0.0", routes=app.routes)
 
 
 # =====================
@@ -165,13 +134,11 @@ class Product(Base):
     weight   = Column(Float, nullable=False)
     price    = Column(Numeric(12, 2), nullable=False)
 
-    # Полные публичные URL из S3
     photo_1 = Column(String, nullable=False)
     photo_2 = Column(String, nullable=True)
     photo_3 = Column(String, nullable=True)
     photo_4 = Column(String, nullable=True)
 
-    # Камень
     stone_type  = Column(String, nullable=True)
     stone_carat = Column(Float, nullable=True)
     stone_shape = Column(String, nullable=True)
@@ -241,13 +208,13 @@ class ProductCreateDTO(BaseModel):
 
 
 class ProductUpdateDTO(BaseModel):
-    name:     Optional[str]        = None
-    category: Optional[str]        = None
-    brand:    Optional[str]        = None
-    material: Optional[str]        = None
+    name:     Optional[str]         = None
+    category: Optional[str]         = None
+    brand:    Optional[str]         = None
+    material: Optional[str]         = None
     size:     Optional[List[float]] = None
-    weight:   Optional[float]      = None
-    price:    Optional[float]      = None
+    weight:   Optional[float]       = None
+    price:    Optional[float]       = None
 
     photo_1: Optional[str] = None
     photo_2: Optional[str] = None
@@ -265,8 +232,10 @@ class ProductUpdateDTO(BaseModel):
 # =====================
 
 @app.post("/upload")
-async def upload_photo(file: UploadFile = File(...)):
-    """Загружает фото в VK Cloud S3, возвращает публичный URL."""
+async def upload_photo(
+    file: UploadFile = File(...),
+    credentials=Depends(basic_auth),
+):
     ext      = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
     filename = f"{uuid4()}{ext}"
     data     = await file.read()
@@ -276,8 +245,7 @@ async def upload_photo(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
 
-    url = s3_public_url(filename)
-    return {"filename": filename, "url": url}
+    return {"filename": filename, "url": s3_public_url(filename)}
 
 
 # =====================
@@ -302,7 +270,7 @@ def create_request(data: RequestDTO):
         db.close()
 
 
-@app.get("/requests")
+@app.get("/requests", dependencies=[Depends(basic_auth)])
 def get_requests():
     db = SessionLocal()
     try:
@@ -317,7 +285,7 @@ def get_requests():
         db.close()
 
 
-@app.patch("/requests/{request_id}/status")
+@app.patch("/requests/{request_id}/status", dependencies=[Depends(basic_auth)])
 def update_request_status(request_id: str, data: RequestStatusDTO):
     allowed = ["new", "in_progress", "done"]
     if data.status not in allowed:
@@ -334,7 +302,7 @@ def update_request_status(request_id: str, data: RequestStatusDTO):
         db.close()
 
 
-@app.delete("/requests/{request_id}")
+@app.delete("/requests/{request_id}", dependencies=[Depends(basic_auth)])
 def delete_request(request_id: str):
     db = SessionLocal()
     try:
@@ -373,7 +341,7 @@ def get_product(product_id: str):
         db.close()
 
 
-@app.post("/products")
+@app.post("/products", dependencies=[Depends(basic_auth)])
 def create_product(data: ProductCreateDTO):
     db = SessionLocal()
     try:
@@ -385,7 +353,7 @@ def create_product(data: ProductCreateDTO):
         db.close()
 
 
-@app.patch("/products/{product_id}")
+@app.patch("/products/{product_id}", dependencies=[Depends(basic_auth)])
 def update_product(product_id: str, data: ProductUpdateDTO):
     db = SessionLocal()
     try:
@@ -400,7 +368,7 @@ def update_product(product_id: str, data: ProductUpdateDTO):
         db.close()
 
 
-@app.delete("/products/{product_id}")
+@app.delete("/products/{product_id}", dependencies=[Depends(basic_auth)])
 def delete_product(product_id: str):
     db = SessionLocal()
     try:
@@ -408,10 +376,8 @@ def delete_product(product_id: str):
         if not product:
             raise HTTPException(404, "Product not found")
 
-        # Удаляем файлы из S3
         for url in [product.photo_1, product.photo_2, product.photo_3, product.photo_4]:
             if url:
-                # Извлекаем filename из полного URL
                 filename = url.split(f"/{VK_BUCKET}/")[-1]
                 try:
                     s3_delete(filename)
