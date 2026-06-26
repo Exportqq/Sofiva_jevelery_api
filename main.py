@@ -109,12 +109,21 @@ async def ip_whitelist(request: Request, call_next):
     is_public = match_route(request.method, request.url.path)
     if not is_public:
         forwarded_for = request.headers.get("X-Forwarded-For")
-        if forwarded_for:
+        x_real_ip = request.headers.get("X-Real-IP")
+
+        if x_real_ip:
+            client_ip = x_real_ip.strip()
+        elif forwarded_for:
+            # Берём первый IP в цепочке — это оригинальный клиент
             client_ip = forwarded_for.split(",")[0].strip()
         else:
             client_ip = request.client.host
+
         if client_ip not in ALLOWED_IPS:
-            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Forbidden", "your_ip": client_ip}  # временно для дебага
+            )
     return await call_next(request)
 
 
