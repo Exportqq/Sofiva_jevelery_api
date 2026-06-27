@@ -1,43 +1,91 @@
-import os
-import shutil
-from uuid import uuid4
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, HTTPException, Header, Form, File, UploadFile, Depends
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, Text, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.exc import IntegrityError
-from passlib.context import CryptContext
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+from sqlalchemy import create_engine, Column, String, Text, Float, Numeric, ARRAY, Integer, ForeignKey, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from pydantic import BaseModel
+from uuid import uuid4
+from typing import Optional, List
 from datetime import datetime, timezone
+import os
+import boto3
+import secrets
+from botocore.client import Config
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL         = os.getenv("DATABASE_URL")
+VK_ACCESS_KEY_ID     = os.getenv("VK_ACCESS_KEY_ID")
+VK_SECRET_ACCESS_KEY = os.getenv("VK_SECRET_ACCESS_KEY")
+VK_BUCKET            = os.getenv("VK_BUCKET", "sofiva-products")
+VK_ENDPOINT          = os.getenv("VK_ENDPOINT", "https://hb.vkcs.cloud")
+ADMIN_LOGIN          = os.getenv("ADMIN_LOGIN", "admin")
+ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "changeme")
 
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    connect_args={"sslmode": "require"}
+    pool_recycle=300,
+    pool_size=5,
+    max_overflow=10,
 )
-
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-UPLOAD_DIR = "/data/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# =====================
+# S3 CLIENT
+# =====================
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    yield
+s3 = boto3.client(
+    "s3",
+    endpoint_url=VK_ENDPOINT,
+    aws_access_key_id=VK_ACCESS_KEY_ID,
+    aws_secret_access_key=VK_SECRET_ACCESS_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="ru-msk",
+)
+
+def s3_public_url(filename: str) -> str:
+    return f"{VK_ENDPOINT}/{VK_BUCKET}/{filename}"
+
+def s3_upload(filename: str, data: bytes, content_type: str) -> None:
+    s3.put_object(
+        Bucket=VK_BUCKET,
+        Key=filename,
+        Body=data,
+        ContentType=content_type,
+        ACL="public-read",
+    )
+
+def s3_delete(filename: str) -> None:
+    s3.delete_object(Bucket=VK_BUCKET, Key=filename)
 
 
-app = FastAPI(lifespan=lifespan)
+# =====================
+# BASIC AUTH
+# =====================
 
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+security = HTTPBasic()
+
+def basic_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    ok_login    = secrets.compare_digest(credentials.username, ADMIN_LOGIN)
+    ok_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (ok_login and ok_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials
+
+
+# =====================
+# APP
+# =====================
+
+app = FastAPI(docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,606 +95,471 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# DATABASE MODELS
-# =========================
 
-class UserDB(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    username = Column(String, unique=True, nullable=False)
-    password_hash = Column(String, nullable=False)
+# =====================
+# SWAGGER (защищённый)
+# =====================
 
+@app.get("/docs", include_in_schema=False)
+def custom_swagger(credentials=Depends(basic_auth)):
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="SofiVa API")
 
-class TokenDB(Base):
-    __tablename__ = "tokens"
-    token = Column(String, primary_key=True)
-    username = Column(String, nullable=False)
+@app.get("/openapi.json", include_in_schema=False)
+def custom_openapi_json(credentials=Depends(basic_auth)):
+    return get_openapi(title="SofiVa API", version="1.0.0", routes=app.routes)
 
 
-class BrandDB(Base):
-    __tablename__ = "brands"
+# =====================
+# MODELS
+# =====================
 
-    id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True, nullable=False)
-    image = Column(String, nullable=False)
+class RequestModel(Base):
+    __tablename__ = "requests"
 
-    cars = relationship("CarDB", back_populates="brand")
-
-
-class CarDB(Base):
-    __tablename__ = "cars"
-
-    id = Column(Integer, primary_key=True)
-
-    name = Column(String, nullable=False)
-    transmission = Column(String, nullable=False)
-    seats = Column(Integer, nullable=False)
-    fuel_type = Column(String, nullable=False)
-
-    car_image = Column(String, nullable=False)
-
-    rating = Column(Float, default=0)
-    reviews_count = Column(String, default="0")
-    horsepower = Column(String, nullable=False)
-    max_speed = Column(String, nullable=False)
-    characteristics = Column(String, nullable=False)
-
-    price_per_hour = Column(Integer, nullable=False)
-    price_per_day = Column(Integer, nullable=False)
-
-    location = Column(String, nullable=False)
-    lat = Column(Float, nullable=False)
-    lng = Column(Float, nullable=False)
-
-    is_favorite = Column(Integer, default=0)
-
-    brand_id = Column(Integer, ForeignKey("brands.id"))
-    brand = relationship("BrandDB", back_populates="cars")
+    id      = Column(String, primary_key=True)
+    name    = Column(String)
+    phone   = Column(String)
+    comment = Column(Text)
+    status  = Column(String, default="new")
 
 
-class OrderDB(Base):
+class Product(Base):
+    __tablename__ = "products"
+
+    id       = Column(String, primary_key=True)
+    name     = Column(String, nullable=False)
+    category = Column(String, nullable=False)
+    brand    = Column(String, nullable=False)
+    material = Column(String, nullable=False)
+    size     = Column(ARRAY(Float), nullable=False)
+    weight   = Column(Float, nullable=False)
+    price    = Column(Numeric(12, 2), nullable=False)
+
+    photo_1 = Column(String, nullable=False)
+    photo_2 = Column(String, nullable=True)
+    photo_3 = Column(String, nullable=True)
+    photo_4 = Column(String, nullable=True)
+
+    stone_type  = Column(String, nullable=True)
+    stone_carat = Column(Float, nullable=True)
+    stone_shape = Column(String, nullable=True)
+    stone_color = Column(String, nullable=True)
+
+
+class OrderModel(Base):
     __tablename__ = "orders"
 
-    id = Column(Integer, primary_key=True)
-    name = Column(String, nullable=False)
-    phone = Column(String, nullable=False)
-    comment = Column(Text, nullable=True)
-    status = Column(String, default="new")   # new | in_progress | done
+    id         = Column(String, primary_key=True)
+    name       = Column(String, nullable=False)
+    phone      = Column(String, nullable=False)
+    comment    = Column(Text, nullable=True)
+    status     = Column(String, default="new")   # new | in_progress | done
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    items = relationship("OrderItemDB", back_populates="order", cascade="all, delete-orphan")
+    items = relationship("OrderItemModel", back_populates="order", cascade="all, delete-orphan")
 
 
-class OrderItemDB(Base):
+class OrderItemModel(Base):
     __tablename__ = "order_items"
 
-    id = Column(Integer, primary_key=True)
-    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
-    car_id = Column(Integer, ForeignKey("cars.id"), nullable=False)
-    rent_type = Column(String, nullable=False)   # "hour" | "day"
-    quantity = Column(Integer, default=1)
+    id         = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    order_id   = Column(String, ForeignKey("orders.id"), nullable=False)
+    product_id = Column(String, nullable=False)   # не FK — продукт может быть удалён
+    name       = Column(String, nullable=False)   # снапшот названия на момент заказа
+    photo      = Column(String, nullable=True)    # снапшот фото
+    size       = Column(Float, nullable=True)     # выбранный размер
+    price      = Column(Numeric(12, 2), nullable=False)  # снапшот цены
+    quantity   = Column(Integer, default=1)
 
-    order = relationship("OrderDB", back_populates="items")
-    car = relationship("CarDB")
-
-
-# =========================
-# SCHEMAS
-# =========================
-
-class AuthRequest(BaseModel):
-    username: str
-    password: str
+    order = relationship("OrderModel", back_populates="items")
 
 
-class AuthResponse(BaseModel):
-    token: str
-    username: str
+Base.metadata.create_all(bind=engine)
 
 
-class ProfileResponse(BaseModel):
-    username: str
+# =====================
+# HELPERS
+# =====================
+
+def product_to_dict(p: Product) -> dict:
+    photos = [f for f in [p.photo_1, p.photo_2, p.photo_3, p.photo_4] if f]
+    return {
+        "id":       p.id,
+        "name":     p.name,
+        "category": p.category,
+        "brand":    p.brand,
+        "material": p.material,
+        "size":     p.size if isinstance(p.size, list) else p.size,
+        "weight":   p.weight,
+        "price":    float(p.price),
+        "photos":   photos,
+        "stone": {
+            "type":  p.stone_type,
+            "carat": p.stone_carat,
+            "shape": p.stone_shape,
+            "color": p.stone_color,
+        } if p.stone_type else None,
+    }
 
 
-class BrandResponse(BaseModel):
-    id: int
-    name: str
-    image: str
-    count: int
+def order_to_dict(o: OrderModel) -> dict:
+    return {
+        "id":         o.id,
+        "name":       o.name,
+        "phone":      o.phone,
+        "comment":    o.comment,
+        "status":     o.status,
+        "created_at": o.created_at.isoformat(),
+        "items": [
+            {
+                "id":         i.id,
+                "product_id": i.product_id,
+                "name":       i.name,
+                "photo":      i.photo,
+                "size":       i.size,
+                "price":      float(i.price),
+                "quantity":   i.quantity,
+            }
+            for i in o.items
+        ],
+    }
 
 
-class Car(BaseModel):
-    id: int | None = None
-    name: str
-    brand: str
-    brand_image: str
-    transmission: str
-    seats: int
-    fuel_type: str
-    car_image: str
-    rating: float
-    reviews_count: str
-    horsepower: str
-    max_speed: str
-    characteristics: str
-    price_per_hour: int
-    price_per_day: int
-    location: str
-    lat: float
-    lng: float
-    is_favorite: bool
+# =====================
+# DTO
+# =====================
 
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- Order schemas ---
-
-class OrderItemRequest(BaseModel):
-    car_id: int
-    rent_type: str   # "hour" | "day"
-    quantity: int = 1
-
-
-class OrderRequest(BaseModel):
+class RequestDTO(BaseModel):
     name: str
     phone: str
     comment: str | None = None
-    items: list[OrderItemRequest]
 
 
-class OrderItemResponse(BaseModel):
-    car_id: int
-    car_name: str
-    car_image: str
-    rent_type: str
-    quantity: int
-    price_per_hour: int
-    price_per_day: int
+class RequestStatusDTO(BaseModel):
+    status: str
 
 
-class OrderResponse(BaseModel):
-    id: int
+class ProductCreateDTO(BaseModel):
+    name: str
+    category: str
+    brand: str
+    material: str
+    size: List[float]
+    weight: float
+    price: float
+
+    photo_1: str
+    photo_2: Optional[str] = None
+    photo_3: Optional[str] = None
+    photo_4: Optional[str] = None
+
+    stone_type:  Optional[str]   = None
+    stone_carat: Optional[float] = None
+    stone_shape: Optional[str]   = None
+    stone_color: Optional[str]   = None
+
+
+class ProductUpdateDTO(BaseModel):
+    name:     Optional[str]         = None
+    category: Optional[str]         = None
+    brand:    Optional[str]         = None
+    material: Optional[str]         = None
+    size:     Optional[List[float]] = None
+    weight:   Optional[float]       = None
+    price:    Optional[float]       = None
+
+    photo_1: Optional[str] = None
+    photo_2: Optional[str] = None
+    photo_3: Optional[str] = None
+    photo_4: Optional[str] = None
+
+    stone_type:  Optional[str]   = None
+    stone_carat: Optional[float] = None
+    stone_shape: Optional[str]   = None
+    stone_color: Optional[str]   = None
+
+
+# --- Order DTOs ---
+
+class OrderItemDTO(BaseModel):
+    product_id: str
+    name: str
+    photo: Optional[str] = None
+    size: Optional[float] = None
+    price: float
+    quantity: int = 1
+
+
+class OrderCreateDTO(BaseModel):
     name: str
     phone: str
-    comment: str | None
+    comment: Optional[str] = None
+    items: List[OrderItemDTO]
+
+
+class OrderStatusDTO(BaseModel):
     status: str
-    created_at: datetime
-    items: list[OrderItemResponse]
 
 
-# =========================
-# AUTH
-# =========================
+# =====================
+# UPLOAD
+# =====================
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(password, hashed)
-
-
-def get_current_user(authorization: str = Header(...)) -> str:
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401)
-
-    token = authorization.split(" ")[1]
-    db = SessionLocal()
-
-    try:
-        token_db = db.query(TokenDB).filter(TokenDB.token == token).first()
-        if not token_db:
-            raise HTTPException(status_code=401)
-        return token_db.username
-    finally:
-        db.close()
-
-
-# =========================
-# AUTH ENDPOINTS
-# =========================
-
-@app.post("/auth/register", response_model=AuthResponse)
-def register(data: AuthRequest):
-    db = SessionLocal()
-    try:
-        user = UserDB(
-            username=data.username,
-            password_hash=hash_password(data.password)
-        )
-        db.add(user)
-        db.commit()
-
-        token = str(uuid4())
-        db.add(TokenDB(token=token, username=user.username))
-        db.commit()
-
-        return {"token": token, "username": user.username}
-
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="User exists")
-    finally:
-        db.close()
-
-
-@app.post("/auth/login", response_model=AuthResponse)
-def login(data: AuthRequest):
-    db = SessionLocal()
-    try:
-        user = db.query(UserDB).filter(UserDB.username == data.username).first()
-
-        if not user or not verify_password(data.password, user.password_hash):
-            raise HTTPException(status_code=401)
-
-        token = str(uuid4())
-        db.add(TokenDB(token=token, username=user.username))
-        db.commit()
-
-        return {"token": token, "username": user.username}
-    finally:
-        db.close()
-
-
-# =========================
-# BRAND ENDPOINTS
-# =========================
-
-@app.post("/brands", response_model=BrandResponse)
-def create_brand(
-    name: str = Form(...),
-    image: UploadFile = File(...)
+@app.post("/upload")
+async def upload_photo(
+    file: UploadFile = File(...),
+    credentials=Depends(basic_auth),
 ):
+    ext      = os.path.splitext(file.filename or "")[1].lower() or ".jpg"
+    filename = f"{uuid4()}{ext}"
+    data     = await file.read()
+
+    try:
+        s3_upload(filename, data, file.content_type or "image/jpeg")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+
+    return {"filename": filename, "url": s3_public_url(filename)}
+
+
+# =====================
+# REQUESTS ENDPOINTS
+# =====================
+
+@app.post("/requests")
+def create_request(data: RequestDTO):
     db = SessionLocal()
     try:
-        existing = db.query(BrandDB).filter(BrandDB.name == name).first()
-        if existing:
-            raise HTTPException(status_code=400, detail="Brand exists")
-
-        filename = f"{uuid4()}_{image.filename}"
-        path = os.path.join(UPLOAD_DIR, filename)
-
-        with open(path, "wb") as f:
-            shutil.copyfileobj(image.file, f)
-
-        brand = BrandDB(
-            name=name,
-            image=f"/uploads/{filename}"
+        req = RequestModel(
+            id=str(uuid4()),
+            name=data.name,
+            phone=data.phone,
+            comment=data.comment,
+            status="new",
         )
-
-        db.add(brand)
+        db.add(req)
         db.commit()
-        db.refresh(brand)
-
-        return {
-            "id": brand.id,
-            "name": brand.name,
-            "image": brand.image,
-            "count": 0
-        }
-
+        return {"ok": True, "id": req.id}
     finally:
         db.close()
 
 
-@app.get("/brands", response_model=list[BrandResponse])
-def get_brands():
+@app.get("/requests", dependencies=[Depends(basic_auth)])
+def get_requests():
     db = SessionLocal()
     try:
-        brands = db.query(BrandDB).all()
-
-        return [
-            {
-                "id": b.id,
-                "name": b.name,
-                "image": b.image,
-                "count": len(b.cars)
-            }
-            for b in brands
-        ]
-
+        return [{
+            "id":      r.id,
+            "name":    r.name,
+            "phone":   r.phone,
+            "comment": r.comment,
+            "status":  r.status,
+        } for r in db.query(RequestModel).all()]
     finally:
         db.close()
 
 
-# =========================
-# CAR ENDPOINTS
-# =========================
-
-@app.post("/cars", response_model=Car)
-def create_car(
-    name: str = Form(...),
-    brand_id: int = Form(...),
-    transmission: str = Form(...),
-    seats: int = Form(...),
-    fuel_type: str = Form(...),
-    car_image: UploadFile = File(...),
-    horsepower: str = Form(...),
-    max_speed: str = Form(...),
-    characteristics: str = Form(...),
-    price_per_hour: int = Form(...),
-    price_per_day: int = Form(...),
-    location: str = Form(...),
-    lat: float = Form(...),
-    lng: float = Form(...)
-):
+@app.patch("/requests/{request_id}/status", dependencies=[Depends(basic_auth)])
+def update_request_status(request_id: str, data: RequestStatusDTO):
+    allowed = ["new", "in_progress", "done"]
+    if data.status not in allowed:
+        raise HTTPException(400, f"Status must be one of: {allowed}")
     db = SessionLocal()
-
     try:
-        brand = db.query(BrandDB).filter(BrandDB.id == brand_id).first()
-        if not brand:
-            raise HTTPException(status_code=404, detail="Brand not found")
-
-        filename = f"{uuid4()}_{car_image.filename}"
-        path = os.path.join(UPLOAD_DIR, filename)
-
-        with open(path, "wb") as f:
-            shutil.copyfileobj(car_image.file, f)
-
-        car = CarDB(
-            name=name,
-            transmission=transmission,
-            seats=seats,
-            fuel_type=fuel_type,
-            car_image=f"/uploads/{filename}",
-            horsepower=horsepower,
-            max_speed=max_speed,
-            characteristics=characteristics,
-            price_per_hour=price_per_hour,
-            price_per_day=price_per_day,
-            location=location,
-            lat=lat,
-            lng=lng,
-            brand_id=brand.id
-        )
-
-        db.add(car)
+        req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+        if not req:
+            raise HTTPException(404, "Not found")
+        req.status = data.status
         db.commit()
-        db.refresh(car)
-
-        return Car(
-            id=car.id,
-            name=car.name,
-            brand=brand.name,
-            brand_image=brand.image,
-            transmission=car.transmission,
-            seats=car.seats,
-            fuel_type=car.fuel_type,
-            car_image=car.car_image,
-            rating=car.rating,
-            reviews_count=car.reviews_count,
-            horsepower=car.horsepower,
-            max_speed=car.max_speed,
-            characteristics=car.characteristics,
-            price_per_hour=car.price_per_hour,
-            price_per_day=car.price_per_day,
-            location=car.location,
-            lat=car.lat,
-            lng=car.lng,
-            is_favorite=False
-        )
-
+        return {"ok": True}
     finally:
         db.close()
 
 
-@app.get("/cars", response_model=list[Car])
-def get_cars():
+@app.delete("/requests/{request_id}", dependencies=[Depends(basic_auth)])
+def delete_request(request_id: str):
     db = SessionLocal()
     try:
-        cars = db.query(CarDB).all()
-
-        return [
-            Car(
-                id=c.id,
-                name=c.name,
-                brand=c.brand.name if c.brand else "",
-                brand_image=c.brand.image if c.brand else "",
-                transmission=c.transmission,
-                seats=c.seats,
-                fuel_type=c.fuel_type,
-                car_image=c.car_image,
-                rating=c.rating,
-                reviews_count=c.reviews_count,
-                horsepower=c.horsepower,
-                max_speed=c.max_speed,
-                characteristics=c.characteristics,
-                price_per_hour=c.price_per_hour,
-                price_per_day=c.price_per_day,
-                location=c.location,
-                lat=c.lat,
-                lng=c.lng,
-                is_favorite=bool(c.is_favorite)
-            )
-            for c in cars
-        ]
-
+        req = db.query(RequestModel).filter(RequestModel.id == request_id).first()
+        if not req:
+            raise HTTPException(404, "Not found")
+        db.delete(req)
+        db.commit()
+        return {"ok": True}
     finally:
         db.close()
 
 
-@app.get("/cars/{car_id}", response_model=Car)
-def get_car(car_id: int):
-    db = SessionLocal()
-    try:
-        c = db.query(CarDB).filter(CarDB.id == car_id).first()
+# =====================
+# ORDERS ENDPOINTS
+# =====================
 
-        if not c:
-            raise HTTPException(status_code=404)
-
-        return Car(
-            id=c.id,
-            name=c.name,
-            brand=c.brand.name if c.brand else "",
-            brand_image=c.brand.image if c.brand else "",
-            transmission=c.transmission,
-            seats=c.seats,
-            fuel_type=c.fuel_type,
-            car_image=c.car_image,
-            rating=c.rating,
-            reviews_count=c.reviews_count,
-            horsepower=c.horsepower,
-            max_speed=c.max_speed,
-            characteristics=c.characteristics,
-            price_per_hour=c.price_per_hour,
-            price_per_day=c.price_per_day,
-            location=c.location,
-            lat=c.lat,
-            lng=c.lng,
-            is_favorite=bool(c.is_favorite)
-        )
-
-    finally:
-        db.close()
-
-
-# =========================
-# ORDER ENDPOINTS
-# =========================
-
-def _build_order_response(order: OrderDB) -> OrderResponse:
-    items = []
-    for item in order.items:
-        car = item.car
-        items.append(OrderItemResponse(
-            car_id=car.id,
-            car_name=car.name,
-            car_image=car.car_image,
-            rent_type=item.rent_type,
-            quantity=item.quantity,
-            price_per_hour=car.price_per_hour,
-            price_per_day=car.price_per_day,
-        ))
-
-    return OrderResponse(
-        id=order.id,
-        name=order.name,
-        phone=order.phone,
-        comment=order.comment,
-        status=order.status,
-        created_at=order.created_at,
-        items=items,
-    )
-
-
-@app.post("/orders", response_model=OrderResponse, status_code=201)
-def create_order(data: OrderRequest):
-    """Создать заявку из корзины. Авторизация не требуется."""
+@app.post("/orders", status_code=201)
+def create_order(data: OrderCreateDTO):
     if not data.items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
+        raise HTTPException(400, "Cart is empty")
 
     db = SessionLocal()
     try:
-        # Проверяем, что все автомобили существуют
-        car_ids = [i.car_id for i in data.items]
-        cars_in_db = db.query(CarDB).filter(CarDB.id.in_(car_ids)).all()
-        found_ids = {c.id for c in cars_in_db}
-        missing = set(car_ids) - found_ids
-        if missing:
-            raise HTTPException(status_code=404, detail=f"Cars not found: {missing}")
-
-        # Валидация rent_type
-        for item in data.items:
-            if item.rent_type not in ("hour", "day"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"rent_type must be 'hour' or 'day', got '{item.rent_type}'"
-                )
-
-        order = OrderDB(
+        order = OrderModel(
+            id=str(uuid4()),
             name=data.name,
             phone=data.phone,
             comment=data.comment,
         )
         db.add(order)
-        db.flush()  # получаем order.id до commit
+        db.flush()
 
         for item in data.items:
-            db.add(OrderItemDB(
+            db.add(OrderItemModel(
                 order_id=order.id,
-                car_id=item.car_id,
-                rent_type=item.rent_type,
+                product_id=item.product_id,
+                name=item.name,
+                photo=item.photo,
+                size=item.size,
+                price=item.price,
                 quantity=item.quantity,
             ))
 
         db.commit()
         db.refresh(order)
-
-        return _build_order_response(order)
-
+        return {"ok": True, "id": order.id}
     finally:
         db.close()
 
 
-@app.get("/orders", response_model=list[OrderResponse])
-def get_orders(_: str = Depends(get_current_user)):
-    """Список всех заявок — только для авторизованных (админ)."""
+@app.get("/orders", dependencies=[Depends(basic_auth)])
+def get_orders():
     db = SessionLocal()
     try:
-        orders = db.query(OrderDB).order_by(OrderDB.created_at.desc()).all()
-        return [_build_order_response(o) for o in orders]
+        orders = db.query(OrderModel).order_by(OrderModel.created_at.desc()).all()
+        return [order_to_dict(o) for o in orders]
     finally:
         db.close()
 
 
-@app.get("/orders/{order_id}", response_model=OrderResponse)
-def get_order(order_id: int, _: str = Depends(get_current_user)):
-    """Получить конкретную заявку — только для авторизованных."""
+@app.get("/orders/{order_id}", dependencies=[Depends(basic_auth)])
+def get_order(order_id: str):
     db = SessionLocal()
     try:
-        order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
+        order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
         if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-        return _build_order_response(order)
+            raise HTTPException(404, "Order not found")
+        return order_to_dict(order)
     finally:
         db.close()
 
 
-@app.patch("/orders/{order_id}/status", response_model=OrderResponse)
-def update_order_status(
-    order_id: int,
-    status: str,
-    _: str = Depends(get_current_user)
-):
-    """Сменить статус заявки: new → in_progress → done."""
-    if status not in ("new", "in_progress", "done"):
-        raise HTTPException(status_code=400, detail="Invalid status")
-
+@app.patch("/orders/{order_id}/status", dependencies=[Depends(basic_auth)])
+def update_order_status(order_id: str, data: OrderStatusDTO):
+    allowed = ["new", "in_progress", "done"]
+    if data.status not in allowed:
+        raise HTTPException(400, f"Status must be one of: {allowed}")
     db = SessionLocal()
     try:
-        order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
+        order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
         if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-
-        order.status = status
+            raise HTTPException(404, "Order not found")
+        order.status = data.status
         db.commit()
-        db.refresh(order)
-
-        return _build_order_response(order)
+        return {"ok": True}
     finally:
         db.close()
 
 
-@app.delete("/orders/{order_id}", status_code=204)
-def delete_order(order_id: int, _: str = Depends(get_current_user)):
-    """Удалить заявку — только для авторизованных."""
+@app.delete("/orders/{order_id}", dependencies=[Depends(basic_auth)])
+def delete_order(order_id: str):
     db = SessionLocal()
     try:
-        order = db.query(OrderDB).filter(OrderDB.id == order_id).first()
+        order = db.query(OrderModel).filter(OrderModel.id == order_id).first()
         if not order:
-            raise HTTPException(status_code=404, detail="Order not found")
-
+            raise HTTPException(404, "Order not found")
         db.delete(order)
         db.commit()
+        return {"ok": True}
     finally:
         db.close()
 
 
-# =========================
-# PROFILE
-# =========================
+# =====================
+# PRODUCTS ENDPOINTS
+# =====================
 
-@app.get("/profile", response_model=ProfileResponse)
-def get_profile(user: str = Depends(get_current_user)):
-    return {"username": user}
+@app.get("/products")
+def get_products():
+    db = SessionLocal()
+    try:
+        return [product_to_dict(p) for p in db.query(Product).all()]
+    finally:
+        db.close()
+
+
+@app.get("/products/{product_id}")
+def get_product(product_id: str):
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if not product:
+            raise HTTPException(404, "Product not found")
+        return product_to_dict(product)
+    finally:
+        db.close()
+
+
+@app.post("/products", dependencies=[Depends(basic_auth)])
+def create_product(data: ProductCreateDTO):
+    db = SessionLocal()
+    try:
+        product = Product(id=str(uuid4()), **data.model_dump())
+        db.add(product)
+        db.commit()
+        return {"ok": True, "id": product.id}
+    finally:
+        db.close()
+
+
+@app.patch("/products/{product_id}", dependencies=[Depends(basic_auth)])
+def update_product(product_id: str, data: ProductUpdateDTO):
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if not product:
+            raise HTTPException(404, "Product not found")
+        for field, value in data.model_dump(exclude_unset=True).items():
+            setattr(product, field, value)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.delete("/products/{product_id}", dependencies=[Depends(basic_auth)])
+def delete_product(product_id: str):
+    db = SessionLocal()
+    try:
+        product = db.query(Product).filter(Product.id == product_id).first()
+        if not product:
+            raise HTTPException(404, "Product not found")
+
+        for url in [product.photo_1, product.photo_2, product.photo_3, product.photo_4]:
+            if url:
+                filename = url.split(f"/{VK_BUCKET}/")[-1]
+                try:
+                    s3_delete(filename)
+                except Exception:
+                    pass
+
+        db.delete(product)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+# =====================
+# ROOT
+# =====================
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
